@@ -1,3 +1,4 @@
+
 #include "search.h"
 #include "evaluation.h"
 
@@ -6,17 +7,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <limits>
-#include <utility>
+#include <string>
 #include <vector>
-
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
 
 namespace promethius {
 
-// These definitions must match board.cpp and movegen.cpp.
 struct Board {
     std::array<int8_t, 64> squares{};
     int sideToMove = 0;
@@ -26,7 +21,7 @@ struct Board {
     uint32_t fullmoveNumber = 1;
     uint8_t kingSquare[2] = {4, 60};
     uint64_t pieceBB[2][7]{};
-    uint64_t occupancy[2] = {0, 0};
+    uint64_t occupancy[2]{};
     uint64_t allOccupancy = 0;
 };
 
@@ -46,274 +41,165 @@ struct Undo {
     uint32_t fullmoveNumber;
 };
 
-void board_make_move(Board* board, Move move, Undo* undo);
-void board_unmake_move(Board* board, Move move, const Undo* undo);
-void generate_legal_moves_fast(Board* board, Move* moves, int* count);
-std::string move_to_uci(Move move);
-bool is_in_check(const Board* board, int color);
+void board_make_move(Board*, Move, Undo*);
+void board_unmake_move(Board*, Move, const Undo*);
+void generate_legal_moves_fast(Board*, Move*, int*);
+std::string move_to_uci(Move);
+bool is_in_check(const Board*, int);
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr int WHITE = 0, BLACK = 1;
-constexpr int PAWN = 1, KNIGHT = 2, BISHOP = 3;
-constexpr int ROOK = 4, QUEEN = 5, KING = 6;
-
+constexpr int INF = 32000;
+constexpr int MATE = 30000;
 constexpr int MAX_PLY = 128;
 constexpr int MAX_MOVES = 256;
-
-constexpr int INF = 32000;
-constexpr int MATE_SCORE = 30000;
-constexpr int MATE_BOUND = 29000;
+constexpr int WHITE = 0;
+constexpr int BLACK = 1;
 
 constexpr int VALUE[7] = {
-    0, 100, 320, 330, 500, 900, 20000
+    0, 100, 320, 335, 500, 950, 20000
 };
 
-constexpr int TT_BITS = 20;
-constexpr size_t TT_SIZE = size_t{1} << TT_BITS;
-constexpr size_t TT_MASK = TT_SIZE - 1;
+constexpr size_t TT_SIZE = 1u << 20;
 
 enum Bound : uint8_t {
-    BOUND_EXACT = 0,
-    BOUND_LOWER = 1,
-    BOUND_UPPER = 2
+    EXACT, LOWER, UPPER
 };
 
-inline int moveFrom(Move move) {
-    return move & 63;
-}
-
-inline int moveTo(Move move) {
-    return (move >> 6) & 63;
-}
-
-inline int movePromotion(Move move) {
-    return (move >> 12) & 7;
-}
-
-inline int absPiece(int piece) {
-    return piece < 0 ? -piece : piece;
-}
-
-inline int popCount(uint64_t b) {
-#if defined(_MSC_VER)
-    return static_cast<int>(__popcnt64(b));
-#else
-    return __builtin_popcountll(b);
-#endif
-}
-
-struct TTEntry {
+struct Entry {
     uint64_t key = 0;
     Move move = 0;
-    int16_t score = 0;
-    int16_t depth = -1;
-    uint8_t bound = BOUND_EXACT;
+    int score = 0;
+    int depth = -1;
+    Bound bound = EXACT;
     uint8_t age = 0;
 };
 
-// The table persists between searches so later moves can reuse it.
-std::vector<TTEntry>& ttTable() {
-    static std::vector<TTEntry> table(TT_SIZE);
-    return table;
+std::vector<Entry>& table() {
+    static std::vector<Entry> t(TT_SIZE);
+    return t;
 }
 
-uint8_t nextAge() {
-    static uint8_t age = 0;
-    return ++age;
-}
-
-uint64_t splitmix64(uint64_t& state) {
-    uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
+uint64_t random64(uint64_t& x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    uint64_t z = x;
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
     return z ^ (z >> 31);
 }
 
-struct ZobristKeys {
+struct Keys {
     uint64_t piece[2][7][64]{};
     uint64_t side = 0;
     uint64_t castle[16]{};
     uint64_t ep[64]{};
-    uint64_t halfmove[101]{};
 
-    ZobristKeys() {
+    Keys() {
         uint64_t seed = 0x50524f4d45544849ULL;
 
-        for (int c = 0; c < 2; ++c)
-            for (int p = 1; p <= 6; ++p)
-                for (int s = 0; s < 64; ++s)
-                    piece[c][p][s] = splitmix64(seed);
+        for (auto& c : piece)
+            for (auto& p : c)
+                for (auto& s : p)
+                    s = random64(seed);
 
-        side = splitmix64(seed);
+        side = random64(seed);
 
-        for (auto& x : castle) x = splitmix64(seed);
-        for (auto& x : ep) x = splitmix64(seed);
-        for (auto& x : halfmove) x = splitmix64(seed);
+        for (auto& x : castle) x = random64(seed);
+        for (auto& x : ep) x = random64(seed);
     }
 };
 
-const ZobristKeys& zobrist() {
-    static const ZobristKeys keys;
-    return keys;
+const Keys& keys() {
+    static const Keys k;
+    return k;
 }
 
-// Position key excludes the halfmove clock, so repetitions can match.
-uint64_t positionKey(const Board* b) {
-    const ZobristKeys& z = zobrist();
-    uint64_t key = 0;
+uint64_t hash(const Board* b) {
+    const Keys& k = keys();
+    uint64_t h = 0;
 
     for (int sq = 0; sq < 64; ++sq) {
-        int piece = b->squares[sq];
+        int p = b->squares[sq];
 
-        if (piece) {
-            key ^= z.piece[piece > 0 ? WHITE : BLACK]
-                          [absPiece(piece)][sq];
-        }
+        if (p)
+            h ^= k.piece[p > 0 ? WHITE : BLACK]
+                       [std::abs(p)][sq];
     }
 
     if (b->sideToMove == BLACK)
-        key ^= z.side;
+        h ^= k.side;
 
-    key ^= z.castle[b->castlingRights & 15];
+    h ^= k.castle[b->castlingRights & 15];
 
     if (b->enPassantSquare >= 0 && b->enPassantSquare < 64)
-        key ^= z.ep[b->enPassantSquare];
+        h ^= k.ep[b->enPassantSquare];
 
-    return key;
+    return h;
 }
 
-inline int scoreToTT(int score, int ply) {
-    if (score > MATE_BOUND) return score + ply;
-    if (score < -MATE_BOUND) return score - ply;
-    return score;
-}
+int from(Move m) { return m & 63; }
+int to(Move m) { return (m >> 6) & 63; }
+int promo(Move m) { return (m >> 12) & 7; }
 
-inline int scoreFromTT(int score, int ply) {
-    if (score > MATE_BOUND) return score - ply;
-    if (score < -MATE_BOUND) return score + ply;
-    return score;
-}
+int capturedValue(const Board* b, Move m) {
+    int victim = std::abs(b->squares[to(m)]);
 
-bool isCapture(const Board* b, Move move) {
-    int from = moveFrom(move);
-    int to = moveTo(move);
+    if (victim) return VALUE[victim];
 
-    if (b->squares[to] != 0)
-        return true;
-
-    // En passant captures an empty target square.
-    return absPiece(b->squares[from]) == PAWN &&
-           to == b->enPassantSquare &&
-           ((from & 7) != (to & 7));
-}
-
-int capturedPieceValue(const Board* b, Move move) {
-    int victim = absPiece(b->squares[moveTo(move)]);
-
-    if (victim)
-        return VALUE[victim];
-
-    int from = moveFrom(move);
-    int to = moveTo(move);
-
-    if (absPiece(b->squares[from]) == PAWN &&
-        to == b->enPassantSquare &&
-        ((from & 7) != (to & 7))) {
-        return VALUE[PAWN];
-    }
+    if (std::abs(b->squares[from(m)]) == 1 &&
+        to(m) == b->enPassantSquare &&
+        (from(m) & 7) != (to(m) & 7))
+        return VALUE[1];
 
     return 0;
 }
 
-int promotionValue(int promo) {
-    if (promo <= 0 || promo > 4)
-        return 0;
-
-    // Promotion codes: knight=1, bishop=2, rook=3, queen=4.
-    return VALUE[promo + 1];
+bool capture(const Board* b, Move m) {
+    return capturedValue(b, m) != 0;
 }
 
-bool hasNullMoveMaterial(const Board* b, int side) {
-    if (b->pieceBB[side][ROOK] || b->pieceBB[side][QUEEN])
-        return true;
-
-    return popCount(b->pieceBB[side][KNIGHT] |
-                    b->pieceBB[side][BISHOP]) >= 2;
+int promotionValue(Move m) {
+    int p = promo(m);
+    return p >= 1 && p <= 4 ? VALUE[p + 1] : 0;
 }
 
-bool insufficientMaterial(const Board* b) {
-    if (b->pieceBB[WHITE][PAWN] || b->pieceBB[BLACK][PAWN] ||
-        b->pieceBB[WHITE][ROOK] || b->pieceBB[BLACK][ROOK] ||
-        b->pieceBB[WHITE][QUEEN] || b->pieceBB[BLACK][QUEEN]) {
-        return false;
-    }
-
-    int knights = popCount(b->pieceBB[WHITE][KNIGHT] |
-                           b->pieceBB[BLACK][KNIGHT]);
-
-    uint64_t bishops = b->pieceBB[WHITE][BISHOP] |
-                       b->pieceBB[BLACK][BISHOP];
-
-    int bishopCount = popCount(bishops);
-
-    if (knights + bishopCount <= 1)
-        return true;
-
-    if (knights != 0)
-        return false;
-
-    // Bishops alone on the same square colour cannot force mate.
-    int squareColor = -1;
-
-    while (bishops) {
-#if defined(_MSC_VER)
-        unsigned long index = 0;
-        _BitScanForward64(&index, bishops);
-        int sq = static_cast<int>(index);
-#else
-        int sq = __builtin_ctzll(bishops);
-#endif
-        bishops &= bishops - 1;
-
-        int current = ((sq & 7) + (sq >> 3)) & 1;
-
-        if (squareColor < 0)
-            squareColor = current;
-        else if (squareColor != current)
-            return false;
-    }
-
-    return true;
+int mateToTT(int s, int ply) {
+    if (s > MATE - MAX_PLY) return s + ply;
+    if (s < -MATE + MAX_PLY) return s - ply;
+    return s;
 }
 
-struct SearchContext {
-    SearchControl* control = nullptr;
-    uint64_t nodeLimit = 0;
+int mateFromTT(int s, int ply) {
+    if (s > MATE - MAX_PLY) return s - ply;
+    if (s < -MATE + MAX_PLY) return s + ply;
+    return s;
+}
+
+struct Context {
+    SearchControl* control;
+    uint64_t nodeLimit;
     uint64_t nodes = 0;
     bool stopped = false;
 
     Clock::time_point start = Clock::now();
+    std::vector<Entry>& tt = table();
     uint8_t age = 0;
 
-    std::array<std::array<Move, 2>, MAX_PLY> killers{};
+    Move killers[MAX_PLY][2]{};
     int history[2][64][64]{};
-
     uint64_t path[MAX_PLY]{};
-    uint32_t bHalfmoveAtPath[MAX_PLY]{};
+    int pathPly = 0;
 
-    std::vector<TTEntry>& tt;
-
-    explicit SearchContext(SearchControl* c, uint64_t limit)
-        : control(c), nodeLimit(limit), tt(ttTable()) {
-        age = nextAge();
+    explicit Context(SearchControl* c, uint64_t limit)
+        : control(c), nodeLimit(limit) {
+        static uint8_t nextAge = 0;
+        age = ++nextAge;
     }
 
-    bool visitNode() {
-        if (stopped)
-            return false;
+    bool visit() {
+        if (stopped) return false;
 
         if (control && control->stop.load(std::memory_order_relaxed)) {
             stopped = true;
@@ -327,24 +213,16 @@ struct SearchContext {
 
         ++nodes;
 
-        // Poll the clock periodically instead of calling it at every node.
-        if ((nodes & 127ULL) == 0 || nodes == 1) {
-            if (control) {
-                int64_t deadline =
-                    control->deadlineNs.load(std::memory_order_relaxed);
+        if ((nodes & 255) == 0 && control) {
+            int64_t deadline =
+                control->deadlineNs.load(std::memory_order_relaxed);
 
-                if (deadline > 0) {
-                    int64_t now =
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            Clock::now().time_since_epoch()).count();
+            if (deadline > 0) {
+                int64_t now =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now().time_since_epoch()).count();
 
-                    if (now >= deadline) {
-                        stopped = true;
-                        return false;
-                    }
-                }
-
-                if (control->stop.load(std::memory_order_relaxed)) {
+                if (now >= deadline) {
                     stopped = true;
                     return false;
                 }
@@ -354,414 +232,308 @@ struct SearchContext {
         return true;
     }
 
-    bool isRepetition(uint64_t key, int ply) const {
-        if (ply < 2)
-            return false;
-
-        int earliest = std::max(
-            0, ply - static_cast<int>(
-                std::min<uint32_t>(100, bHalfmoveAtPath[ply])));
-
-        for (int i = ply - 2; i >= earliest; i -= 2) {
-            if (path[i] == key)
-                return true;
+    bool repetition(uint64_t h, int ply) const {
+        for (int i = ply - 2; i >= 0; i -= 2) {
+            if (path[i] == h) return true;
         }
-
         return false;
     }
 
-    TTEntry* probe(uint64_t key) {
-        TTEntry& entry = tt[static_cast<size_t>(key) & TT_MASK];
-        return entry.key == key ? &entry : nullptr;
+    Entry* probe(uint64_t h) {
+        Entry& e = tt[h & (TT_SIZE - 1)];
+        return e.key == h ? &e : nullptr;
     }
 
-    void store(uint64_t key, Move move, int score,
-               int depth, Bound bound, int ply) {
-        TTEntry& entry = tt[static_cast<size_t>(key) & TT_MASK];
+    void store(uint64_t h, Move m, int s, int d,
+               Bound b, int ply) {
+        Entry& e = tt[h & (TT_SIZE - 1)];
 
-        if (entry.key != key || entry.age != age ||
-            depth >= entry.depth - 2 || bound == BOUND_EXACT) {
-            entry.key = key;
-            entry.move = move;
-            entry.score = static_cast<int16_t>(scoreToTT(score, ply));
-            entry.depth = static_cast<int16_t>(depth);
-            entry.bound = bound;
-            entry.age = age;
+        if (e.key != h || e.age != age ||
+            d >= e.depth || b == EXACT) {
+            e.key = h;
+            e.move = m;
+            e.score = mateToTT(s, ply);
+            e.depth = d;
+            e.bound = b;
+            e.age = age;
         }
     }
 
-    int moveOrderScore(const Board* b, Move move,
-                       Move ttMove, int ply) const {
-        if (move == ttMove && move != 0)
-            return 2'000'000;
+    int orderScore(const Board* b, Move m, Move ttMove,
+                   int ply) const {
+        if (m == ttMove && m != 0) return 2000000;
 
-        int promo = movePromotion(move);
-        int side = b->sideToMove;
-        int from = moveFrom(move);
-        int to = moveTo(move);
+        int p = promo(m);
+        if (p) return 1000000 + promotionValue(m);
 
-        if (promo)
-            return 1'000'000 + promotionValue(promo);
-
-        if (isCapture(b, move)) {
-            int victim = capturedPieceValue(b, move);
-            int attacker = VALUE[absPiece(b->squares[from])];
-
-            return 900'000 + victim * 16 - attacker;
+        if (capture(b, m)) {
+            int attacker = std::abs(b->squares[from(m)]);
+            return 900000 + capturedValue(b, m) * 16
+                          - VALUE[attacker];
         }
 
         if (ply < MAX_PLY) {
-            if (killers[ply][0] == move)
-                return 800'000;
-
-            if (killers[ply][1] == move)
-                return 700'000;
+            if (killers[ply][0] == m) return 800000;
+            if (killers[ply][1] == m) return 700000;
         }
 
-        return history[side][from][to];
+        return history[b->sideToMove][from(m)][to(m)];
     }
 
-    void orderMoves(const Board* b, Move* moves, int count,
-                    Move ttMove, int ply) const {
-        std::sort(moves, moves + count,
-            [&](Move a, Move other) {
-                return moveOrderScore(b, a, ttMove, ply) >
-                       moveOrderScore(b, other, ttMove, ply);
-            });
+    void order(Board* b, Move* moves, int count,
+               Move ttMove, int ply) {
+        std::sort(moves, moves + count, [&](Move a, Move c) {
+            return orderScore(b, a, ttMove, ply) >
+                   orderScore(b, c, ttMove, ply);
+        });
     }
 
-    void recordQuietCutoff(const Board* b, Move move,
-                           int depth, int ply) {
-        if (isCapture(b, move) || movePromotion(move))
-            return;
+    void quietCutoff(const Board* b, Move m, int depth, int ply) {
+        if (capture(b, m) || promo(m)) return;
 
-        if (ply < MAX_PLY && killers[ply][0] != move) {
+        if (killers[ply][0] != m) {
             killers[ply][1] = killers[ply][0];
-            killers[ply][0] = move;
+            killers[ply][0] = m;
         }
 
-        int& h = history[b->sideToMove]
-                        [moveFrom(move)][moveTo(move)];
-
-        h = std::clamp(h + depth * depth * 16, -30000, 30000);
+        int& h = history[b->sideToMove][from(m)][to(m)];
+        h = std::clamp(h + depth * depth * 12, -30000, 30000);
     }
 
-    int quiescence(Board* b, int alpha, int beta,
-                   int ply, bool allowRepetition) {
-        if (!visitNode())
-            return evaluate_position(b);
+    int qsearch(Board* b, int alpha, int beta, int ply) {
+        if (!visit()) return evaluate_position(b);
+        if (ply >= MAX_PLY - 1) return evaluate_position(b);
 
-        if (ply >= MAX_PLY - 1)
-            return evaluate_position(b);
+        uint64_t h = hash(b);
+        path[ply] = h;
 
-        uint64_t repKey = positionKey(b);
-
-        path[ply] = repKey;
-        bHalfmoveAtPath[ply] = b->halfmoveClock;
-
-        if (b->halfmoveClock >= 100 || insufficientMaterial(b))
+        if (b->halfmoveClock >= 100 || repetition(h, ply))
             return 0;
 
-        if (allowRepetition && isRepetition(repKey, ply))
-            return 0;
+        bool check = is_in_check(b, b->sideToMove);
 
-        bool inCheck = is_in_check(b, b->sideToMove);
-
-        int standPat = -INF;
-
-        if (!inCheck) {
-            standPat = evaluate_position(b);
-
-            if (standPat >= beta)
-                return standPat;
-
-            if (standPat > alpha)
-                alpha = standPat;
-        }
-
+        // Generate moves before stand-pat cutoffs so stalemate is detected.
         Move moves[MAX_MOVES];
         int count = 0;
-
         generate_legal_moves_fast(b, moves, &count);
 
         if (count == 0)
-            return inCheck ? -MATE_SCORE + ply : 0;
+            return check ? -MATE + ply : 0;
 
-        orderMoves(b, moves, count, 0, ply);
+        int stand = -INF;
+
+        if (!check) {
+            stand = evaluate_position(b);
+
+            if (stand >= beta) return stand;
+            if (stand > alpha) alpha = stand;
+        }
+
+        order(b, moves, count, 0, ply);
 
         for (int i = 0; i < count; ++i) {
-            Move move = moves[i];
+            Move m = moves[i];
 
-            // Outside check, only search captures and promotions.
-            if (!inCheck && !isCapture(b, move) &&
-                !movePromotion(move)) {
+            if (!check && !capture(b, m) && !promo(m))
                 continue;
-            }
 
-            Undo undo{};
-            board_make_move(b, move, &undo);
+            Undo u{};
+            board_make_move(b, m, &u);
+            int score = -qsearch(b, -beta, -alpha, ply + 1);
+            board_unmake_move(b, m, &u);
 
-            int score = -quiescence(
-                b, -beta, -alpha, ply + 1, allowRepetition);
-
-            board_unmake_move(b, move, &undo);
-
-            if (stopped)
-                return alpha;
-
-            if (score >= beta)
-                return score;
-
-            if (score > alpha)
-                alpha = score;
+            if (stopped) return alpha;
+            if (score >= beta) return score;
+            if (score > alpha) alpha = score;
         }
 
         return alpha;
     }
 
-    int negamax(Board* b, int depth, int alpha, int beta,
-                int ply, bool allowRepetition = true) {
-        if (depth <= 0)
-            return quiescence(b, alpha, beta, ply, allowRepetition);
+    int search(Board* b, int depth, int alpha, int beta, int ply) {
+        if (depth <= 0) return qsearch(b, alpha, beta, ply);
+        if (!visit()) return evaluate_position(b);
+        if (ply >= MAX_PLY - 1) return evaluate_position(b);
 
-        if (!visitNode())
-            return evaluate_position(b);
+        uint64_t h = hash(b);
+        path[ply] = h;
 
-        if (ply >= MAX_PLY - 1)
-            return evaluate_position(b);
-
-        uint64_t repKey = positionKey(b);
-
-        // TT key additionally includes the halfmove clock.
-        uint64_t key = repKey ^
-            zobrist().halfmove[std::min<uint32_t>(100, b->halfmoveClock)];
-
-        path[ply] = repKey;
-        bHalfmoveAtPath[ply] = b->halfmoveClock;
-
-        if (b->halfmoveClock >= 100 || insufficientMaterial(b))
+        if (b->halfmoveClock >= 100 || repetition(h, ply))
             return 0;
 
-        if (allowRepetition && isRepetition(repKey, ply))
-            return 0;
+        bool check = is_in_check(b, b->sideToMove);
 
-        bool inCheck = is_in_check(b, b->sideToMove);
+        // Check extensions improve forcing-line visibility.
+        if (check && depth < MAX_PLY - ply - 1)
+            ++depth;
+
         int originalAlpha = alpha;
-        bool pvNode = beta - alpha > 1;
-
         Move ttMove = 0;
 
-        if (TTEntry* entry = probe(key)) {
-            ttMove = entry->move;
+        if (Entry* e = probe(h)) {
+            ttMove = e->move;
 
-            if (entry->depth >= depth && !pvNode) {
-                int ttScore = scoreFromTT(entry->score, ply);
+            if (e->depth >= depth) {
+                int s = mateFromTT(e->score, ply);
 
-                if (entry->bound == BOUND_EXACT)
-                    return ttScore;
-
-                if (entry->bound == BOUND_LOWER && ttScore >= beta)
-                    return ttScore;
-
-                if (entry->bound == BOUND_UPPER && ttScore <= alpha)
-                    return ttScore;
-            } else if (entry->depth >= depth &&
-                       entry->bound == BOUND_EXACT) {
-                return scoreFromTT(entry->score, ply);
+                if (e->bound == EXACT) return s;
+                if (e->bound == LOWER && s >= beta) return s;
+                if (e->bound == UPPER && s <= alpha) return s;
             }
         }
 
-        // Null-move pruning, disabled in check and low-material positions.
-        if (depth >= 3 && !inCheck && !pvNode &&
-            beta < MATE_BOUND && beta > -MATE_BOUND &&
-            hasNullMoveMaterial(b, b->sideToMove)) {
+        // Null-move pruning, only outside check and with non-pawn material.
+        if (depth >= 3 && !check && beta < MATE - MAX_PLY &&
+            beta > -MATE + MAX_PLY) {
+            int side = b->sideToMove;
+            uint64_t nonPawns =
+                b->pieceBB[side][2] | b->pieceBB[side][3] |
+                b->pieceBB[side][4] | b->pieceBB[side][5];
 
-            int oldSide = b->sideToMove;
-            int oldEp = b->enPassantSquare;
-            uint32_t oldFullmove = b->fullmoveNumber;
+            if (nonPawns) {
+                int oldEp = b->enPassantSquare;
+                uint32_t oldHalf = b->halfmoveClock;
+                uint32_t oldFull = b->fullmoveNumber;
 
-            b->sideToMove ^= 1;
-            b->enPassantSquare = -1;
+                b->sideToMove ^= 1;
+                b->enPassantSquare = -1;
+                ++b->halfmoveClock;
+                if (side == BLACK) ++b->fullmoveNumber;
 
-            if (oldSide == BLACK)
-                ++b->fullmoveNumber;
+                int reduction = depth >= 6 ? 3 : 2;
+                int score = -search(b, depth - 1 - reduction,
+                                    -beta, -beta + 1, ply + 1);
 
-            int reduction = depth >= 6 ? 3 : 2;
+                b->sideToMove = side;
+                b->enPassantSquare = oldEp;
+                b->halfmoveClock = oldHalf;
+                b->fullmoveNumber = oldFull;
 
-            int score = -negamax(
-                b, depth - 1 - reduction, -beta, -beta + 1,
-                ply + 1, false);
-
-            b->sideToMove = oldSide;
-            b->enPassantSquare = oldEp;
-            b->fullmoveNumber = oldFullmove;
-
-            if (stopped)
-                return alpha;
-
-            if (score >= beta)
-                return score;
+                if (stopped) return alpha;
+                if (score >= beta) return score;
+            }
         }
 
         Move moves[MAX_MOVES];
         int count = 0;
-
         generate_legal_moves_fast(b, moves, &count);
 
         if (count == 0)
-            return inCheck ? -MATE_SCORE + ply : 0;
+            return check ? -MATE + ply : 0;
 
-        orderMoves(b, moves, count, ttMove, ply);
+        order(b, moves, count, ttMove, ply);
 
-        int bestScore = -INF;
+        int best = -INF;
         Move bestMove = 0;
         int searched = 0;
 
         for (int i = 0; i < count; ++i) {
-            Move move = moves[i];
+            Move m = moves[i];
+            bool quiet = !capture(b, m) && !promo(m);
 
-            bool quiet =
-                !isCapture(b, move) && movePromotion(move) == 0;
-
-            Undo undo{};
-            board_make_move(b, move, &undo);
+            Undo u{};
+            board_make_move(b, m, &u);
 
             int score;
 
             if (searched == 0) {
-                score = -negamax(
-                    b, depth - 1, -beta, -alpha, ply + 1,
-                    allowRepetition);
+                score = -search(b, depth - 1,
+                                -beta, -alpha, ply + 1);
             } else {
                 int reduction = 0;
 
-                // Late-move reduction for quiet, late-ordered moves.
-                if (depth >= 3 && searched >= 3 && quiet && !inCheck) {
-                    reduction = 1 +
-                        (searched >= 8 && depth >= 5 ? 1 : 0);
-                }
+                if (depth >= 3 && searched >= 4 && quiet && !check)
+                    reduction = depth >= 6 && searched >= 10 ? 2 : 1;
 
-                // Principal-variation search with a narrow window.
-                score = -negamax(
-                    b, depth - 1 - reduction, -alpha - 1, -alpha,
-                    ply + 1, allowRepetition);
+                score = -search(b, depth - 1 - reduction,
+                                -alpha - 1, -alpha, ply + 1);
 
-                if (!stopped && score > alpha && reduction > 0) {
-                    score = -negamax(
-                        b, depth - 1, -alpha - 1, -alpha,
-                        ply + 1, allowRepetition);
-                }
+                if (!stopped && reduction && score > alpha)
+                    score = -search(b, depth - 1,
+                                    -alpha - 1, -alpha, ply + 1);
 
-                if (!stopped && score > alpha && score < beta) {
-                    score = -negamax(
-                        b, depth - 1, -beta, -alpha, ply + 1,
-                        allowRepetition);
-                }
+                if (!stopped && score > alpha && score < beta)
+                    score = -search(b, depth - 1,
+                                    -beta, -alpha, ply + 1);
             }
 
-            board_unmake_move(b, move, &undo);
+            board_unmake_move(b, m, &u);
 
-            if (stopped)
-                return alpha;
+            if (stopped) return alpha;
 
             ++searched;
 
-            if (score > bestScore) {
-                bestScore = score;
-                bestMove = move;
+            if (score > best) {
+                best = score;
+                bestMove = m;
             }
 
-            if (score > alpha)
-                alpha = score;
+            if (score > alpha) alpha = score;
 
             if (alpha >= beta) {
-                if (quiet)
-                    recordQuietCutoff(b, move, depth, ply);
-
+                if (quiet) quietCutoff(b, m, depth, ply);
                 break;
             }
         }
 
-        Bound bound =
-            bestScore <= originalAlpha ? BOUND_UPPER :
-            bestScore >= beta ? BOUND_LOWER : BOUND_EXACT;
+        Bound bound = best <= originalAlpha ? UPPER :
+                      best >= beta ? LOWER : EXACT;
 
-        store(key, bestMove, bestScore, depth, bound, ply);
-
-        return bestScore;
+        store(h, bestMove, best, depth, bound, ply);
+        return best;
     }
 
-    bool searchRoot(Board* b, std::vector<Move>& rootMoves,
-                    int depth, int& outScore, Move& outMove) {
-        if (!visitNode())
-            return false;
+    bool root(Board* b, std::vector<Move>& moves, int depth,
+              int alpha, int beta, int& score, Move& bestMove) {
+        if (!visit()) return false;
 
-        uint64_t repKey = positionKey(b);
-
-        uint64_t key = repKey ^
-            zobrist().halfmove[std::min<uint32_t>(100, b->halfmoveClock)];
-
-        path[0] = repKey;
-        bHalfmoveAtPath[0] = b->halfmoveClock;
+        uint64_t h = hash(b);
+        path[0] = h;
 
         Move ttMove = 0;
+        if (Entry* e = probe(h)) ttMove = e->move;
 
-        if (TTEntry* entry = probe(key))
-            ttMove = entry->move;
+        std::sort(moves.begin(), moves.end(), [&](Move a, Move c) {
+            return orderScore(b, a, ttMove, 0) >
+                   orderScore(b, c, ttMove, 0);
+        });
 
-        std::sort(rootMoves.begin(), rootMoves.end(),
-            [&](Move a, Move c) {
-                return moveOrderScore(b, a, ttMove, 0) >
-                       moveOrderScore(b, c, ttMove, 0);
-            });
-
-        int alpha = -INF;
-        const int beta = INF;
-
-        int bestScore = -INF;
-        Move bestMove = rootMoves.front();
+        int best = -INF;
+        Move chosen = moves.front();
         int searched = 0;
 
-        for (Move move : rootMoves) {
-            Undo undo{};
-            board_make_move(b, move, &undo);
+        for (Move m : moves) {
+            Undo u{};
+            board_make_move(b, m, &u);
 
-            int score;
+            int s;
 
             if (searched == 0) {
-                score = -negamax(
-                    b, depth - 1, -beta, -alpha, 1, true);
+                s = -search(b, depth - 1, -beta, -alpha, 1);
             } else {
-                score = -negamax(
-                    b, depth - 1, -alpha - 1, -alpha, 1, true);
+                s = -search(b, depth - 1, -alpha - 1, -alpha, 1);
 
-                if (!stopped && score > alpha && score < beta) {
-                    score = -negamax(
-                        b, depth - 1, -beta, -alpha, 1, true);
-                }
+                if (!stopped && s > alpha && s < beta)
+                    s = -search(b, depth - 1, -beta, -alpha, 1);
             }
 
-            board_unmake_move(b, move, &undo);
+            board_unmake_move(b, m, &u);
 
-            if (stopped)
-                return false;
+            if (stopped) return false;
 
             ++searched;
 
-            if (score > bestScore) {
-                bestScore = score;
-                bestMove = move;
+            if (s > best) {
+                best = s;
+                chosen = m;
             }
 
-            if (score > alpha)
-                alpha = score;
+            if (s > alpha) alpha = s;
         }
 
-        store(key, bestMove, bestScore, depth, BOUND_EXACT, 0);
-
-        outScore = bestScore;
-        outMove = bestMove;
-
+        store(h, chosen, best, depth, EXACT, 0);
+        score = best;
+        bestMove = chosen;
         return true;
     }
 };
@@ -769,97 +541,93 @@ struct SearchContext {
 } // namespace
 
 SearchResult search_best_move(
-    Board* board,
-    int maxDepth,
-    uint64_t nodeLimit,
+    Board* board, int maxDepth, uint64_t nodeLimit,
     const std::vector<std::string>& searchMoves,
     std::function<void(const SearchIteration&)> onIteration,
     SearchControl* control) {
 
     SearchResult result;
+    if (!board) return result;
 
-    if (!board)
-        return result;
-
-    SearchContext ctx(control, nodeLimit);
-    ctx.start = Clock::now();
-
+    Context ctx(control, nodeLimit);
     maxDepth = std::clamp(maxDepth, 1, MAX_PLY - 2);
 
-    Move legalMoves[MAX_MOVES];
-    int legalCount = 0;
+    Move legal[MAX_MOVES];
+    int count = 0;
+    generate_legal_moves_fast(board, legal, &count);
 
-    generate_legal_moves_fast(board, legalMoves, &legalCount);
-
-    if (legalCount == 0) {
-        result.score = is_in_check(board, board->sideToMove)
-            ? -MATE_SCORE : 0;
-
+    if (!count) {
+        result.score = is_in_check(board, board->sideToMove) ? -MATE : 0;
         return result;
     }
 
     std::vector<Move> roots;
-    roots.reserve(static_cast<size_t>(legalCount));
+    for (int i = 0; i < count; ++i) {
+        std::string uci = move_to_uci(legal[i]);
 
-    if (searchMoves.empty()) {
-        for (int i = 0; i < legalCount; ++i)
-            roots.push_back(legalMoves[i]);
-    } else {
-        for (int i = 0; i < legalCount; ++i) {
-            std::string uci = move_to_uci(legalMoves[i]);
-
-            if (std::find(searchMoves.begin(), searchMoves.end(), uci)
-                != searchMoves.end()) {
-                roots.push_back(legalMoves[i]);
-            }
-        }
+        if (searchMoves.empty() ||
+            std::find(searchMoves.begin(), searchMoves.end(), uci)
+                != searchMoves.end())
+            roots.push_back(legal[i]);
     }
 
-    if (roots.empty())
-        return result;
+    if (roots.empty()) return result;
 
-    // Always retain a legal fallback move if the search is stopped early.
     result.bestMove = move_to_uci(roots.front());
     result.score = evaluate_position(board);
-    result.depth = 0;
 
-    for (int depth = 1;
-         depth <= maxDepth && !ctx.stopped;
-         ++depth) {
+    int previousScore = 0;
 
-        int score = result.score;
-        Move bestMove = roots.front();
+    for (int depth = 1; depth <= maxDepth && !ctx.stopped; ++depth) {
+        int window = depth >= 4 ? 35 : INF;
+        int alpha = std::max(-INF, previousScore - window);
+        int beta = std::min(INF, previousScore + window);
+        int score = previousScore;
+        Move best = roots.front();
 
-        if (!ctx.searchRoot(board, roots, depth, score, bestMove))
+        while (true) {
+            if (!ctx.root(board, roots, depth, alpha, beta, score, best))
+                break;
+
+            if (score <= alpha && alpha > -INF) {
+                window *= 2;
+                alpha = std::max(-INF, score - window);
+                continue;
+            }
+
+            if (score >= beta && beta < INF) {
+                window *= 2;
+                beta = std::min(INF, score + window);
+                continue;
+            }
+
             break;
+        }
 
-        // Only completed iterations replace the previous best move.
-        result.bestMove = move_to_uci(bestMove);
+        if (ctx.stopped) break;
+
+        result.bestMove = move_to_uci(best);
         result.score = score;
         result.depth = depth;
         result.nodes = ctx.nodes;
+        previousScore = score;
 
         if (onIteration) {
-            auto elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    Clock::now() - ctx.start).count();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - ctx.start).count();
 
-            uint64_t ms = static_cast<uint64_t>(
-                std::max<int64_t>(0, elapsed));
+            SearchIteration it;
+            it.depth = depth;
+            it.score = score;
+            it.nodes = ctx.nodes;
+            it.timeMs = static_cast<uint64_t>(std::max<int64_t>(0, ms));
+            it.nps = ctx.nodes * 1000 /
+                std::max<uint64_t>(1, it.timeMs);
 
-            SearchIteration iteration;
-            iteration.depth = depth;
-            iteration.score = score;
-            iteration.nodes = ctx.nodes;
-            iteration.timeMs = ms;
-            iteration.nps = static_cast<uint64_t>(
-                static_cast<long double>(ctx.nodes) * 1000.0L /
-                static_cast<long double>(std::max<uint64_t>(1, ms)));
-
-            onIteration(iteration);
+            onIteration(it);
         }
 
-        if (std::abs(score) >= MATE_SCORE - MAX_PLY)
+        if (std::abs(score) >= MATE - MAX_PLY)
             break;
     }
 
