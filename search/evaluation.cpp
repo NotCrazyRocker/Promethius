@@ -25,6 +25,9 @@ struct Board {
     uint64_t allOccupancy = 0;
 };
 
+// Provided by movegen.cpp.
+bool is_square_attacked(const Board*, int, int);
+
 namespace {
 
 constexpr int WHITE = 0, BLACK = 1;
@@ -100,35 +103,32 @@ inline int popCount(uint64_t bits) {
 bool isPassedPawn(const Board* b, int sq, int color) {
     int file = fileOf(sq);
     int rank = relativeRank(sq, color);
-
     uint64_t enemyPawns = b->pieceBB[color ^ 1][PAWN];
 
     while (enemyPawns) {
         int other = popLsb(enemyPawns);
 
-        if (std::abs(fileOf(other) - file) > 1)
-            continue;
-
-        if (relativeRank(other, color) > rank)
+        if (std::abs(fileOf(other) - file) <= 1 &&
+            relativeRank(other, color) > rank)
             return false;
     }
 
     return true;
 }
 
-bool isSupportedKnightOutpost(const Board* b, int sq, int color) {
+bool supportedKnightOutpost(const Board* b, int sq, int color) {
     int rank = relativeRank(sq, color);
 
     if (rank < 3 || rank > 5)
         return false;
 
-    // Require support from a friendly pawn behind the knight.
     int supportRank = color == WHITE ? rankOf(sq) - 1
                                      : rankOf(sq) + 1;
 
     if (supportRank < 0 || supportRank > 7)
         return false;
 
+    int ownPawn = color == WHITE ? PAWN : -PAWN;
     bool supported = false;
 
     for (int df : {-1, 1}) {
@@ -137,26 +137,21 @@ bool isSupportedKnightOutpost(const Board* b, int sq, int color) {
         if (file < 0 || file > 7)
             continue;
 
-        int supportSq = supportRank * 8 + file;
-        int expectedPawn = color == WHITE ? PAWN : -PAWN;
-
-        if (b->squares[supportSq] == expectedPawn)
+        if (b->squares[supportRank * 8 + file] == ownPawn)
             supported = true;
     }
 
     if (!supported)
         return false;
 
-    // An enemy pawn farther forward on an adjacent file can challenge it.
     uint64_t enemyPawns = b->pieceBB[color ^ 1][PAWN];
 
     while (enemyPawns) {
         int other = popLsb(enemyPawns);
 
         if (std::abs(fileOf(other) - fileOf(sq)) <= 1 &&
-            relativeRank(other, color) > rank) {
+            relativeRank(other, color) > rank)
             return false;
-        }
     }
 
     return true;
@@ -211,14 +206,49 @@ int pieceMobility(const Board* b, int sq, int kind, int color) {
     return mobility;
 }
 
+int kingDanger(const Board* b, int color) {
+    int king = b->kingSquare[color];
+    int kf = fileOf(king);
+    int kr = rankOf(king);
+    int danger = 0;
+
+    // Penalize attacked squares around the king that it could otherwise
+    // use as escape squares. Friendly-occupied squares are ignored.
+    for (int df = -1; df <= 1; ++df) {
+        for (int dr = -1; dr <= 1; ++dr) {
+            if (df == 0 && dr == 0)
+                continue;
+
+            int f = kf + df;
+            int r = kr + dr;
+
+            if (f < 0 || f > 7 || r < 0 || r > 7)
+                continue;
+
+            int sq = r * 8 + f;
+            int piece = b->squares[sq];
+
+            if (piece != 0 &&
+                (piece > 0 ? WHITE : BLACK) == color)
+                continue;
+
+            if (is_square_attacked(b, sq, color ^ 1))
+                ++danger;
+        }
+    }
+
+    if (is_square_attacked(b, king, color ^ 1))
+        danger += 2;
+
+    return danger;
+}
+
 int evaluateForWhite(const Board* b) {
     int mg = 0;
     int eg = 0;
     int phase = 0;
-
     int pawnCount[2][8]{};
 
-    // Count pawns on each file.
     for (int color = WHITE; color <= BLACK; ++color) {
         uint64_t pawns = b->pieceBB[color][PAWN];
 
@@ -228,7 +258,6 @@ int evaluateForWhite(const Board* b) {
         }
     }
 
-    // Material, piece-square bonuses and piece activity.
     constexpr int mobilityMG[7] = {
         0, 0, 4, 3, 2, 1, 0
     };
@@ -246,7 +275,6 @@ int evaluateForWhite(const Board* b) {
         int color = piece > 0 ? WHITE : BLACK;
         int kind = absPiece(piece);
         int sign = color == WHITE ? 1 : -1;
-
         int file = fileOf(sq);
         int rank = relativeRank(sq, color);
         int center = centerScore(file, rank);
@@ -264,7 +292,7 @@ int evaluateForWhite(const Board* b) {
             mgPst = center * 8 - (rank == 0 ? 5 : 0);
             egPst = center * 5;
 
-            if (isSupportedKnightOutpost(b, sq, color)) {
+            if (supportedKnightOutpost(b, sq, color)) {
                 mgPst += 14;
                 egPst += 7;
             }
@@ -291,9 +319,8 @@ int evaluateForWhite(const Board* b) {
 
             if (rank <= 1 &&
                 (file == 1 || file == 2 ||
-                 file == 5 || file == 6)) {
+                 file == 5 || file == 6))
                 mgPst += 22;
-            }
             break;
         }
 
@@ -311,7 +338,6 @@ int evaluateForWhite(const Board* b) {
         phase += PHASE_WEIGHT[kind];
     }
 
-    // Pawn structure and passed pawns.
     constexpr int passerMG[8] = {
         0, 0, 8, 14, 24, 42, 72, 0
     };
@@ -323,7 +349,6 @@ int evaluateForWhite(const Board* b) {
     for (int color = WHITE; color <= BLACK; ++color) {
         int sign = color == WHITE ? 1 : -1;
 
-        // Doubled pawns.
         for (int file = 0; file < 8; ++file) {
             if (pawnCount[color][file] > 1) {
                 int extras = pawnCount[color][file] - 1;
@@ -336,7 +361,6 @@ int evaluateForWhite(const Board* b) {
 
         while (pawns) {
             int sq = popLsb(pawns);
-
             int file = fileOf(sq);
             int rank = relativeRank(sq, color);
 
@@ -346,27 +370,25 @@ int evaluateForWhite(const Board* b) {
             bool rightFriendly =
                 file < 7 && pawnCount[color][file + 1] > 0;
 
-            // Isolated pawns.
             if (!leftFriendly && !rightFriendly) {
                 mg -= sign * 12;
                 eg -= sign * 10;
             }
 
-            // Connected pawns supported from behind.
+            // Connected pawns are more difficult to attack.
             int supportRank = color == WHITE ? rankOf(sq) - 1
                                              : rankOf(sq) + 1;
 
             if (supportRank >= 0 && supportRank <= 7) {
+                int ownPawn = color == WHITE ? PAWN : -PAWN;
+
                 for (int df : {-1, 1}) {
                     int f = file + df;
 
                     if (f < 0 || f > 7)
                         continue;
 
-                    int supportSq = supportRank * 8 + f;
-                    int ownPawn = color == WHITE ? PAWN : -PAWN;
-
-                    if (b->squares[supportSq] == ownPawn) {
+                    if (b->squares[supportRank * 8 + f] == ownPawn) {
                         mg += sign * 8;
                         eg += sign * 12;
                         break;
@@ -381,24 +403,22 @@ int evaluateForWhite(const Board* b) {
             mg += sign * passerMG[rank];
             eg += sign * passerEG[rank];
 
-            // In the endgame, a passed pawn is more dangerous when the
-            // enemy king is far away and its own king can support it.
-            int enemyKing = b->kingSquare[color ^ 1];
+            // King support and opposition to the passed pawn.
             int ownKing = b->kingSquare[color];
-
-            int enemyDistance = std::max(
-                std::abs(fileOf(enemyKing) - fileOf(sq)),
-                std::abs(rankOf(enemyKing) - rankOf(sq)));
+            int enemyKing = b->kingSquare[color ^ 1];
 
             int ownDistance = std::max(
-                std::abs(fileOf(ownKing) - fileOf(sq)),
+                std::abs(fileOf(ownKing) - file),
                 std::abs(rankOf(ownKing) - rankOf(sq)));
+
+            int enemyDistance = std::max(
+                std::abs(fileOf(enemyKing) - file),
+                std::abs(rankOf(enemyKing) - rankOf(sq)));
 
             eg += sign * (enemyDistance - ownDistance) * 3;
         }
     }
 
-    // Bishop pair, open files, and king shelter.
     for (int color = WHITE; color <= BLACK; ++color) {
         int sign = color == WHITE ? 1 : -1;
 
@@ -420,13 +440,13 @@ int evaluateForWhite(const Board* b) {
                 eg += sign * 10;
             }
 
-            // An active rook on the seventh rank.
             if (rank == 6) {
                 mg += sign * 12;
                 eg += sign * 18;
             }
         }
 
+        // Pawn shelter for castled or home-rank kings.
         int kingSq = b->kingSquare[color];
         int kingFile = fileOf(kingSq);
         int kingRank = relativeRank(kingSq, color);
@@ -459,9 +479,14 @@ int evaluateForWhite(const Board* b) {
 
             mg += sign * shield;
         }
+
+        // Apply king danger primarily in the middlegame. Tapering through
+        // the phase calculation naturally reduces it during endgames.
+        int danger = kingDanger(b, color);
+        int dangerPenalty = danger * danger * 3 + danger * 4;
+        mg -= sign * dangerPenalty;
     }
 
-    // Promoted material can exceed the normal starting phase.
     phase = std::clamp(phase, 0, MAX_PHASE);
 
     return (mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE;
@@ -474,6 +499,8 @@ int evaluate_position(const Board* board) {
         return 0;
 
     int score = evaluateForWhite(board);
+
+    // Small tempo bonus.
     score += board->sideToMove == WHITE ? 8 : -8;
 
     return board->sideToMove == WHITE ? score : -score;

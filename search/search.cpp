@@ -62,11 +62,12 @@ constexpr int INF = 32000;
 constexpr int MATE = 30000;
 constexpr int MAX_PLY = 128;
 constexpr int MAX_MOVES = 256;
+
 constexpr size_t TT_SIZE = size_t{1} << 20;
 constexpr size_t TT_MASK = TT_SIZE - 1;
 
 constexpr int VALUE[7] = {
-    0, 100, 320, 335, 500, 950, 20000
+    0, 100, 320, 335, 500, 900, 20000
 };
 
 enum Bound : uint8_t {
@@ -75,15 +76,15 @@ enum Bound : uint8_t {
     BOUND_UPPER
 };
 
-inline int moveFrom(Move m) {
+inline int from(Move m) {
     return m & 63;
 }
 
-inline int moveTo(Move m) {
+inline int to(Move m) {
     return (m >> 6) & 63;
 }
 
-inline int movePromotion(Move m) {
+inline int promotion(Move m) {
     return (m >> 12) & 7;
 }
 
@@ -117,11 +118,11 @@ struct TTEntry {
     Move move = 0;
     int16_t score = 0;
     int16_t depth = -1;
-    uint8_t bound = BOUND_EXACT;
+    Bound bound = BOUND_EXACT;
     uint8_t age = 0;
 };
 
-std::vector<TTEntry>& ttTable() {
+std::vector<TTEntry>& transpositionTable() {
     static std::vector<TTEntry> table(TT_SIZE);
     return table;
 }
@@ -133,14 +134,14 @@ uint64_t splitmix64(uint64_t& state) {
     return z ^ (z >> 31);
 }
 
-struct ZobristKeys {
+struct Zobrist {
     uint64_t piece[2][7][64]{};
     uint64_t side = 0;
     uint64_t castle[16]{};
     uint64_t ep[64]{};
     uint64_t halfmove[101]{};
 
-    ZobristKeys() {
+    Zobrist() {
         uint64_t seed = 0x50524f4d45544849ULL;
 
         for (int c = 0; c < 2; ++c)
@@ -156,23 +157,23 @@ struct ZobristKeys {
     }
 };
 
-const ZobristKeys& zobrist() {
-    static const ZobristKeys z;
+const Zobrist& zobrist() {
+    static const Zobrist z;
     return z;
 }
 
 uint64_t positionKey(const Board* b) {
-    const ZobristKeys& z = zobrist();
+    const Zobrist& z = zobrist();
     uint64_t key = 0;
 
-    // Iterate over occupied piece bitboards instead of all 64 squares.
+    // Bitboard iteration avoids scanning all 64 squares for hashing.
     for (int color = WHITE; color <= BLACK; ++color) {
-        for (int piece = PAWN; piece <= KING; ++piece) {
-            uint64_t bits = b->pieceBB[color][piece];
+        for (int kind = PAWN; kind <= KING; ++kind) {
+            uint64_t pieces = b->pieceBB[color][kind];
 
-            while (bits) {
-                int sq = popLsb(bits);
-                key ^= z.piece[color][piece][sq];
+            while (pieces) {
+                int sq = popLsb(pieces);
+                key ^= z.piece[color][kind][sq];
             }
         }
     }
@@ -188,175 +189,46 @@ uint64_t positionKey(const Board* b) {
     return key;
 }
 
-inline uint64_t ttKey(const Board* b, uint64_t key) {
+uint64_t tableKey(const Board* b, uint64_t key) {
     return key ^ zobrist().halfmove[
         std::min<uint32_t>(100, b->halfmoveClock)];
 }
 
-inline int scoreToTT(int score, int ply) {
+inline int mateToTable(int score, int ply) {
     if (score > MATE - MAX_PLY) return score + ply;
     if (score < -MATE + MAX_PLY) return score - ply;
     return score;
 }
 
-inline int scoreFromTT(int score, int ply) {
+inline int mateFromTable(int score, int ply) {
     if (score > MATE - MAX_PLY) return score - ply;
     if (score < -MATE + MAX_PLY) return score + ply;
     return score;
 }
 
-bool isCapture(const Board* b, Move m) {
-    if (b->squares[moveTo(m)] != 0)
-        return true;
-
-    return absPiece(b->squares[moveFrom(m)]) == PAWN &&
-           moveTo(m) == b->enPassantSquare &&
-           ((moveFrom(m) & 7) != (moveTo(m) & 7));
-}
-
-int capturedPieceValue(const Board* b, Move m) {
-    int victim = absPiece(b->squares[moveTo(m)]);
+int capturedValue(const Board* b, Move m) {
+    int victim = absPiece(b->squares[to(m)]);
 
     if (victim)
         return VALUE[victim];
 
-    if (isCapture(b, m))
+    if (absPiece(b->squares[from(m)]) == PAWN &&
+        to(m) == b->enPassantSquare &&
+        ((from(m) & 7) != (to(m) & 7)))
         return VALUE[PAWN];
 
     return 0;
 }
 
-int promotionValue(int promo) {
-    return promo >= 1 && promo <= 4 ? VALUE[promo + 1] : 0;
+bool isCapture(const Board* b, Move m) {
+    return b->squares[to(m)] != 0 ||
+           (absPiece(b->squares[from(m)]) == PAWN &&
+            to(m) == b->enPassantSquare &&
+            ((from(m) & 7) != (to(m) & 7)));
 }
 
-// Used by SEE. Pin legality is intentionally approximated here;
-// SEE is for ordering captures, not deciding whether a move is legal.
-bool attacksSquare(const std::array<int8_t, 64>& board,
-                   int from, int target) {
-    int piece = board[from];
-    if (!piece || from == target)
-        return false;
-
-    int kind = absPiece(piece);
-    int side = piece > 0 ? WHITE : BLACK;
-
-    int ff = from & 7, fr = from >> 3;
-    int tf = target & 7, tr = target >> 3;
-    int df = tf - ff, dr = tr - fr;
-    int adf = std::abs(df), adr = std::abs(dr);
-
-    if (kind == PAWN)
-        return adf == 1 && dr == (side == WHITE ? 1 : -1);
-
-    if (kind == KNIGHT)
-        return (adf == 1 && adr == 2) ||
-               (adf == 2 && adr == 1);
-
-    if (kind == KING)
-        return adf <= 1 && adr <= 1;
-
-    bool diagonal = adf == adr && adf != 0;
-    bool straight = (df == 0) != (dr == 0);
-
-    if (kind == BISHOP && !diagonal) return false;
-    if (kind == ROOK && !straight) return false;
-    if (kind == QUEEN && !diagonal && !straight) return false;
-
-    int stepFile = (df > 0) - (df < 0);
-    int stepRank = (dr > 0) - (dr < 0);
-
-    int f = ff + stepFile;
-    int r = fr + stepRank;
-
-    while (f != tf || r != tr) {
-        if (board[r * 8 + f] != 0)
-            return false;
-
-        f += stepFile;
-        r += stepRank;
-    }
-
-    return true;
-}
-
-int staticExchange(const Board* b, Move move) {
-    if (!isCapture(b, move) && !movePromotion(move))
-        return 0;
-
-    int from = moveFrom(move);
-    int to = moveTo(move);
-    int promo = movePromotion(move);
-
-    int gain[32]{};
-    gain[0] = capturedPieceValue(b, move);
-
-    if (promo)
-        gain[0] += promotionValue(promo) - VALUE[PAWN];
-
-    Board temp = *b;
-    Undo undo{};
-    board_make_move(&temp, move, &undo);
-
-    std::array<int8_t, 64> squares = temp.squares;
-    int occupantValue = VALUE[absPiece(squares[to])];
-    int side = temp.sideToMove;
-    int depth = 0;
-
-    while (depth < 30) {
-        int attackerSq = -1;
-        int attackerValue = INF;
-
-        for (int sq = 0; sq < 64; ++sq) {
-            int p = squares[sq];
-
-            if (!p || (p > 0 ? WHITE : BLACK) != side)
-                continue;
-
-            if (!attacksSquare(squares, sq, to))
-                continue;
-
-            int v = VALUE[absPiece(p)];
-
-            if (v < attackerValue) {
-                attackerValue = v;
-                attackerSq = sq;
-            }
-        }
-
-        if (attackerSq < 0)
-            break;
-
-        ++depth;
-        gain[depth] = occupantValue - gain[depth - 1];
-
-        int attacker = squares[attackerSq];
-        squares[attackerSq] = 0;
-        squares[to] = static_cast<int8_t>(attacker);
-        occupantValue = VALUE[absPiece(attacker)];
-
-        // Account for an exchange pawn promoting on the target square.
-        int targetRank = to >> 3;
-
-        if (absPiece(attacker) == PAWN &&
-            ((side == WHITE && targetRank == 7) ||
-             (side == BLACK && targetRank == 0))) {
-            gain[depth] += VALUE[QUEEN] - VALUE[PAWN];
-            squares[to] = static_cast<int8_t>(
-                side == WHITE ? QUEEN : -QUEEN);
-            occupantValue = VALUE[QUEEN];
-        }
-
-        side ^= 1;
-    }
-
-    while (depth > 0) {
-        gain[depth - 1] =
-            -std::max(-gain[depth - 1], gain[depth]);
-        --depth;
-    }
-
-    return gain[0];
+int promotionValue(int p) {
+    return p >= 1 && p <= 4 ? VALUE[p + 1] : 0;
 }
 
 bool hasNullMoveMaterial(const Board* b, int side) {
@@ -373,31 +245,51 @@ bool insufficientMaterial(const Board* b) {
         b->pieceBB[WHITE][QUEEN] || b->pieceBB[BLACK][QUEEN])
         return false;
 
-    int knights = popCount(b->pieceBB[WHITE][KNIGHT] |
-                           b->pieceBB[BLACK][KNIGHT]);
+    int whiteKnights = popCount(b->pieceBB[WHITE][KNIGHT]);
+    int blackKnights = popCount(b->pieceBB[BLACK][KNIGHT]);
 
     uint64_t bishops = b->pieceBB[WHITE][BISHOP] |
                        b->pieceBB[BLACK][BISHOP];
 
-    if (knights + popCount(bishops) <= 1)
+    int bishopCount = popCount(bishops);
+    int knightCount = whiteKnights + blackKnights;
+
+    if (knightCount + bishopCount <= 1)
         return true;
 
-    if (knights != 0)
+    // K+NN versus a bare king is a dead position.
+    if (bishopCount == 0 &&
+        ((whiteKnights == 2 && blackKnights == 0) ||
+         (blackKnights == 2 && whiteKnights == 0)))
+        return true;
+
+    if (knightCount != 0)
         return false;
 
+    // Bishops alone on one square colour cannot force mate.
     int squareColor = -1;
 
     while (bishops) {
         int sq = popLsb(bishops);
-        int current = ((sq & 7) + (sq >> 3)) & 1;
+        int color = ((sq & 7) + (sq >> 3)) & 1;
 
         if (squareColor < 0)
-            squareColor = current;
-        else if (squareColor != current)
+            squareColor = color;
+        else if (squareColor != color)
             return false;
     }
 
     return true;
+}
+
+struct PersistentHeuristics {
+    int history[2][64][64]{};
+    Move counter[2][64][64]{};
+};
+
+PersistentHeuristics& persistentHeuristics() {
+    static PersistentHeuristics h;
+    return h;
 }
 
 struct OrderedMove {
@@ -409,24 +301,34 @@ struct SearchContext {
     SearchControl* control = nullptr;
     uint64_t nodeLimit = 0;
     uint64_t nodes = 0;
+    uint64_t repetitionHits = 0;
     bool stopped = false;
 
     Clock::time_point start = Clock::now();
     std::vector<TTEntry>& tt;
+    PersistentHeuristics& heuristics;
 
     uint8_t age = 0;
 
     Move killers[MAX_PLY][2]{};
-    int history[2][64][64]{};
-
+    Move previousMove[MAX_PLY]{};
     uint64_t path[MAX_PLY]{};
     uint32_t pathHalfmove[MAX_PLY]{};
     int evalStack[MAX_PLY]{};
 
-    explicit SearchContext(SearchControl* c, uint64_t limit)
-        : control(c), nodeLimit(limit), tt(ttTable()) {
+    SearchContext(SearchControl* c, uint64_t limit)
+        : control(c), nodeLimit(limit),
+          tt(transpositionTable()),
+          heuristics(persistentHeuristics()) {
         static uint8_t nextAge = 0;
         age = ++nextAge;
+
+        // Preserve useful quiet-move statistics between moves, but prevent
+        // old history from dominating indefinitely.
+        for (auto& side : heuristics.history)
+            for (auto& source : side)
+                for (int& value : source)
+                    value = value * 7 / 8;
     }
 
     bool visit() {
@@ -468,9 +370,10 @@ struct SearchContext {
         if (ply < 2)
             return false;
 
-        int earliest = std::max(
-            0, ply - static_cast<int>(
-                std::min<uint32_t>(100, pathHalfmove[ply])));
+        int reversiblePlies = static_cast<int>(
+            std::min<uint32_t>(100, pathHalfmove[ply]));
+
+        int earliest = std::max(0, ply - reversiblePlies);
 
         for (int i = ply - 2; i >= earliest; i -= 2) {
             if (path[i] == key)
@@ -481,68 +384,77 @@ struct SearchContext {
     }
 
     TTEntry* probe(uint64_t key) {
-        TTEntry& entry = tt[static_cast<size_t>(key) & TT_MASK];
-        return entry.key == key ? &entry : nullptr;
+        TTEntry& e = tt[static_cast<size_t>(key) & TT_MASK];
+        return e.key == key ? &e : nullptr;
     }
 
     void store(uint64_t key, Move move, int score,
                int depth, Bound bound, int ply) {
-        TTEntry& entry = tt[static_cast<size_t>(key) & TT_MASK];
+        TTEntry& e = tt[static_cast<size_t>(key) & TT_MASK];
 
-        // Keep a deeper entry for the same position. This prevents a
-        // shallow iteration from needlessly replacing a deeper result.
-        if (entry.key != key || depth >= entry.depth) {
-            entry.key = key;
-            entry.move = move;
-            entry.score = static_cast<int16_t>(scoreToTT(score, ply));
-            entry.depth = static_cast<int16_t>(depth);
-            entry.bound = bound;
-            entry.age = age;
+        if (e.key != key || e.age != age ||
+            depth >= e.depth ||
+            (bound == BOUND_EXACT && depth + 2 >= e.depth)) {
+            e.key = key;
+            e.move = move;
+            e.score = static_cast<int16_t>(mateToTable(score, ply));
+            e.depth = static_cast<int16_t>(depth);
+            e.bound = bound;
+            e.age = age;
         }
     }
 
-    int moveOrderScore(const Board* b, Move move,
-                       Move ttMove, int ply) const {
-        if (move == ttMove && move != 0)
+    Move counterMove(int ply, int side) const {
+        if (ply <= 0)
+            return 0;
+
+        Move previous = previousMove[ply];
+        if (!previous)
+            return 0;
+
+        return heuristics.counter[side][from(previous)][to(previous)];
+    }
+
+    int moveScore(const Board* b, Move m, Move ttMove,
+                  Move counter, int ply) const {
+        if (m == ttMove && m != 0)
             return 2'000'000;
 
-        int promo = movePromotion(move);
-        int from = moveFrom(move);
-        int to = moveTo(move);
+        int promo = promotion(m);
+        int victim = capturedValue(b, m);
 
-        if (promo) {
-            return 1'500'000 + promotionValue(promo) * 8
-                   + capturedPieceValue(b, move) * 2;
-        }
+        if (promo)
+            return 1'500'000 + promotionValue(promo) * 8 +
+                   victim * 2;
 
-        if (isCapture(b, move)) {
-            int see = staticExchange(b, move);
+        if (victim) {
+            int attacker = VALUE[absPiece(b->squares[from(m)])];
 
-            int attacker = VALUE[absPiece(b->squares[from])];
-            int victim = capturedPieceValue(b, move);
-
-            // Winning/equal exchanges precede killers; losing captures
-            // remain searchable but are ordered lower.
-            int base = see >= 0 ? 1'100'000 : 500'000;
-
-            return base + see * 16 + victim * 2 - attacker;
+            // MVV-LVA ordering, avoiding a costly exchange simulation
+            // for every capture at every searched node.
+            return 1'100'000 + victim * 16 - attacker;
         }
 
         if (ply < MAX_PLY) {
-            if (killers[ply][0] == move) return 900'000;
-            if (killers[ply][1] == move) return 850'000;
+            if (m == killers[ply][0]) return 900'000;
+            if (m == killers[ply][1]) return 850'000;
         }
 
-        return history[b->sideToMove][from][to];
+        if (m == counter && m != 0)
+            return 800'000;
+
+        return heuristics.history[b->sideToMove][from(m)][to(m)];
     }
 
     void orderMoves(Board* b, Move* moves, int count,
                     Move ttMove, int ply) {
         std::array<OrderedMove, MAX_MOVES> ordered{};
+        Move counter = counterMove(ply, b->sideToMove);
 
         for (int i = 0; i < count; ++i) {
             ordered[i].move = moves[i];
-            ordered[i].score = moveOrderScore(b, moves[i], ttMove, ply);
+            ordered[i].score = moveScore(
+                b, moves[i], ttMove, counter, ply);
         }
 
         std::sort(ordered.begin(), ordered.begin() + count,
@@ -556,12 +468,11 @@ struct SearchContext {
 
     void orderRoot(Board* b, std::vector<Move>& moves, Move ttMove) {
         std::array<OrderedMove, MAX_MOVES> ordered{};
-
         int count = static_cast<int>(moves.size());
 
         for (int i = 0; i < count; ++i) {
             ordered[i].move = moves[i];
-            ordered[i].score = moveOrderScore(b, moves[i], ttMove, 0);
+            ordered[i].score = moveScore(b, moves[i], ttMove, 0, 0);
         }
 
         std::sort(ordered.begin(), ordered.begin() + count,
@@ -573,24 +484,40 @@ struct SearchContext {
             moves[i] = ordered[i].move;
     }
 
-    void recordQuietCutoff(const Board* b, Move move,
-                           int depth, int ply) {
-        if (isCapture(b, move) || movePromotion(move))
-            return;
+    void updateHistory(int side, Move move, int bonus) {
+        int& h = heuristics.history[side][from(move)][to(move)];
+        h = std::clamp(h + bonus, -30000, 30000);
+    }
+
+    void recordQuietCutoff(int side, Move move, int depth, int ply,
+                           const Move* tried, int triedCount) {
+        int bonus = depth * depth * 16;
+
+        // Penalize earlier quiet moves that failed to produce a cutoff.
+        for (int i = 0; i < triedCount; ++i) {
+            if (tried[i] != move)
+                updateHistory(side, tried[i], -bonus / 2);
+        }
+
+        updateHistory(side, move, bonus);
 
         if (ply < MAX_PLY && killers[ply][0] != move) {
             killers[ply][1] = killers[ply][0];
             killers[ply][0] = move;
         }
 
-        int& h = history[b->sideToMove]
-                        [moveFrom(move)][moveTo(move)];
+        if (ply > 0) {
+            Move previous = previousMove[ply];
 
-        h = std::clamp(h + depth * depth * 16, -30000, 30000);
+            if (previous) {
+                heuristics.counter[side][from(previous)][to(previous)] =
+                    move;
+            }
+        }
     }
 
-    int qsearch(Board* b, int alpha, int beta,
-                int ply, bool allowRepetition) {
+    int quiescence(Board* b, int alpha, int beta,
+                   int ply, bool allowRepetition) {
         if (!visit())
             return evaluate_position(b);
 
@@ -602,65 +529,53 @@ struct SearchContext {
         pathHalfmove[ply] = b->halfmoveClock;
 
         bool inCheck = is_in_check(b, b->sideToMove);
-        bool draw = b->halfmoveClock >= 100 ||
-                    insufficientMaterial(b) ||
-                    (allowRepetition && isRepetition(key, ply));
+        bool repetition = allowRepetition && isRepetition(key, ply);
 
-        Move moves[MAX_MOVES];
-        int count = -1;
+        if (repetition)
+            ++repetitionHits;
 
-        // A checked king can still be checkmated on a draw-clock boundary.
-        if (draw && inCheck) {
-            generate_legal_moves_fast(b, moves, &count);
+        if (b->halfmoveClock >= 100 || insufficientMaterial(b) || repetition) {
+            if (!inCheck)
+                return 0;
 
-            if (count == 0)
-                return -MATE + ply;
+            Move legal[MAX_MOVES];
+            int count = 0;
+            generate_legal_moves_fast(b, legal, &count);
 
-            return 0;
+            return count == 0 ? -MATE + ply : 0;
         }
 
-        if (draw)
-            return 0;
+        Move moves[MAX_MOVES];
+        int count = 0;
+        generate_legal_moves_fast(b, moves, &count);
 
-        int standPat = -INF;
+        if (count == 0)
+            return inCheck ? -MATE + ply : 0;
 
         if (!inCheck) {
-            standPat = evaluate_position(b);
+            int standPat = evaluate_position(b);
 
-            if (standPat >= beta) {
-                // A stand-pat cutoff must not hide stalemate.
-                generate_legal_moves_fast(b, moves, &count);
-
-                if (count == 0)
-                    return 0;
-
+            if (standPat >= beta)
                 return standPat;
-            }
 
             if (standPat > alpha)
                 alpha = standPat;
         }
-
-        if (count < 0)
-            generate_legal_moves_fast(b, moves, &count);
-
-        if (count == 0)
-            return inCheck ? -MATE + ply : 0;
 
         orderMoves(b, moves, count, 0, ply);
 
         for (int i = 0; i < count; ++i) {
             Move move = moves[i];
 
-            // In check, all evasions must be examined.
-            if (!inCheck && !isCapture(b, move) &&
-                !movePromotion(move))
+            if (!inCheck && !isCapture(b, move) && !promotion(move))
                 continue;
+
+            previousMove[ply + 1] = move;
 
             Undo undo{};
             board_make_move(b, move, &undo);
 
-            int score = -qsearch(
+            int score = -quiescence(
                 b, -beta, -alpha, ply + 1, allowRepetition);
 
             board_unmake_move(b, move, &undo);
@@ -682,7 +597,7 @@ struct SearchContext {
                 int ply, bool allowRepetition = true,
                 bool allowNull = true) {
         if (depth <= 0)
-            return qsearch(b, alpha, beta, ply, allowRepetition);
+            return quiescence(b, alpha, beta, ply, allowRepetition);
 
         if (!visit())
             return evaluate_position(b);
@@ -695,47 +610,58 @@ struct SearchContext {
         pathHalfmove[ply] = b->halfmoveClock;
 
         bool inCheck = is_in_check(b, b->sideToMove);
+        bool repetition = allowRepetition && isRepetition(repKey, ply);
 
-        bool draw = b->halfmoveClock >= 100 ||
-                    insufficientMaterial(b) ||
-                    (allowRepetition && isRepetition(repKey, ply));
+        if (repetition)
+            ++repetitionHits;
 
-        // At a draw boundary, verify checkmate first.
-        if (draw) {
+        if (b->halfmoveClock >= 100 ||
+            insufficientMaterial(b) || repetition) {
             if (!inCheck)
                 return 0;
 
-            Move drawMoves[MAX_MOVES];
-            int drawCount = 0;
-            generate_legal_moves_fast(b, drawMoves, &drawCount);
+            Move legal[MAX_MOVES];
+            int count = 0;
+            generate_legal_moves_fast(b, legal, &count);
 
-            return drawCount == 0 ? -MATE + ply : 0;
+            return count == 0 ? -MATE + ply : 0;
         }
 
         if (inCheck && depth < MAX_PLY - ply - 1)
             ++depth;
 
-        uint64_t key = ttKey(b, repKey);
-        bool pvNode = beta - alpha > 1;
+        // Mate-distance pruning.
+        alpha = std::max(alpha, -MATE + ply);
+        beta = std::min(beta, MATE - ply - 1);
+
+        if (alpha >= beta)
+            return alpha;
+
+        uint64_t key = tableKey(b, repKey);
         int originalAlpha = alpha;
+        bool pvNode = beta - alpha > 1;
         Move ttMove = 0;
 
-        if (TTEntry* entry = probe(key)) {
-            ttMove = entry->move;
+        // Skip TT reuse during null-move searches. Such positions are
+        // artificial and should not pollute results for legal positions.
+        if (allowRepetition) {
+            if (TTEntry* e = probe(key)) {
+                ttMove = e->move;
 
-            if (entry->depth >= depth) {
-                int score = scoreFromTT(entry->score, ply);
+                if (e->depth >= depth) {
+                    int score = mateFromTable(e->score, ply);
 
-                if (entry->bound == BOUND_EXACT)
-                    return score;
+                    if (e->bound == BOUND_EXACT)
+                        return score;
 
-                if (!pvNode && entry->bound == BOUND_LOWER &&
-                    score >= beta)
-                    return score;
+                    if (!pvNode && e->bound == BOUND_LOWER &&
+                        score >= beta)
+                        return score;
 
-                if (!pvNode && entry->bound == BOUND_UPPER &&
-                    score <= alpha)
-                    return score;
+                    if (!pvNode && e->bound == BOUND_UPPER &&
+                        score <= alpha)
+                        return score;
+                }
             }
         }
 
@@ -752,17 +678,17 @@ struct SearchContext {
         bool improving = ply >= 2 &&
                          staticEval > evalStack[ply - 2];
 
-        // Reverse futility pruning: conservative, shallow, non-PV only.
-        if (!pvNode && !inCheck && depth <= 3) {
-            int margin = 90 * depth + (improving ? 0 : 35);
+        // Conservative reverse futility pruning at shallow depth.
+        if (!pvNode && !inCheck && depth <= 2) {
+            int margin = 100 * depth + (improving ? 0 : 30);
 
             if (staticEval - margin >= beta)
                 return staticEval - margin;
         }
 
-        // Null-move pruning, with verification in deeper positions.
-        if (allowNull && !pvNode && !inCheck &&
-            depth >= 3 && staticEval >= beta - 90 &&
+        // Null-move pruning with verification in deeper positions.
+        if (allowNull && !pvNode && !inCheck && depth >= 3 &&
+            staticEval >= beta - 80 &&
             beta > -MATE + MAX_PLY && beta < MATE - MAX_PLY &&
             hasNullMoveMaterial(b, b->sideToMove)) {
 
@@ -776,7 +702,9 @@ struct SearchContext {
             if (oldSide == BLACK)
                 ++b->fullmoveNumber;
 
-            int reduction = depth >= 6 ? 3 : 2;
+            previousMove[ply + 1] = 0;
+
+            int reduction = 2 + (depth >= 7 ? 1 : 0);
 
             int score = -negamax(
                 b, depth - 1 - reduction, -beta, -beta + 1,
@@ -790,8 +718,6 @@ struct SearchContext {
                 return alpha;
 
             if (score >= beta) {
-                // Verification reduces false cutoffs in zugzwang-like
-                // positions, especially when the search is deep.
                 if (depth >= 7) {
                     int verify = negamax(
                         b, depth - reduction, beta - 1, beta,
@@ -813,31 +739,40 @@ struct SearchContext {
         int bestScore = -INF;
         Move bestMove = 0;
         int searched = 0;
+        int quietTriedCount = 0;
+        Move quietTried[MAX_MOVES]{};
+
+        // If any repetition affected this node, don't save its result:
+        // a draw caused by path history is not a position-only score.
+        uint64_t repetitionCountBefore = repetitionHits;
 
         for (int i = 0; i < count; ++i) {
             Move move = moves[i];
 
-            bool quiet = !isCapture(b, move) &&
-                         movePromotion(move) == 0;
-
+            bool quiet = !isCapture(b, move) && !promotion(move);
             int movingSide = b->sideToMove;
+
             Undo undo{};
             board_make_move(b, move, &undo);
 
             bool givesCheck = is_in_check(b, b->sideToMove);
 
-            // Prune only late, quiet moves that do not give check.
-            if (searched > 0 && !pvNode && !inCheck && depth <= 3 &&
-                quiet && !givesCheck && move != ttMove &&
-                move != killers[ply][0] && move != killers[ply][1]) {
+            // Shallow quiet-move futility pruning.
+            if (searched > 0 && !pvNode && !inCheck &&
+                depth <= 2 && quiet && !givesCheck &&
+                move != ttMove && move != killers[ply][0] &&
+                move != killers[ply][1] &&
+                move != counterMove(ply, movingSide)) {
 
-                int margin = 110 * depth;
+                int margin = 100 * depth;
 
                 if (staticEval + margin <= alpha) {
                     board_unmake_move(b, move, &undo);
                     continue;
                 }
             }
+
+            previousMove[ply + 1] = move;
 
             int score;
 
@@ -851,15 +786,19 @@ struct SearchContext {
                 if (depth >= 3 && searched >= 3 && quiet &&
                     !inCheck && !givesCheck &&
                     move != killers[ply][0] &&
-                    move != killers[ply][1]) {
+                    move != killers[ply][1] &&
+                    move != counterMove(ply, movingSide)) {
 
                     reduction = 1;
 
                     if (depth >= 6 && searched >= 8)
-                        ++reduction;
+                        reduction = 2;
 
-                    if (history[movingSide][moveFrom(move)][moveTo(move)] < -100)
-                        ++reduction;
+                    int h = heuristics.history[movingSide]
+                                               [from(move)][to(move)];
+
+                    if (h > 3000)
+                        reduction = std::max(0, reduction - 1);
                 }
 
                 reduction = std::clamp(
@@ -898,48 +837,62 @@ struct SearchContext {
                 alpha = score;
 
             if (alpha >= beta) {
-                if (quiet)
-                    recordQuietCutoff(b, move, depth, ply);
+                if (quiet) {
+                    recordQuietCutoff(movingSide, move, depth, ply,
+                                      quietTried, quietTriedCount);
+                }
 
                 break;
             }
+
+            if (quiet && quietTriedCount < MAX_MOVES)
+                quietTried[quietTriedCount++] = move;
         }
 
         if (searched == 0)
             return staticEval;
 
-        Bound bound = bestScore <= originalAlpha ? BOUND_UPPER :
-                      bestScore >= beta ? BOUND_LOWER : BOUND_EXACT;
+        // Do not cache path-dependent search results.
+        if (allowRepetition && repetitionHits == repetitionCountBefore) {
+            Bound bound = bestScore <= originalAlpha ? BOUND_UPPER :
+                          bestScore >= beta ? BOUND_LOWER : BOUND_EXACT;
 
-        store(key, bestMove, bestScore, depth, bound, ply);
+            store(key, bestMove, bestScore, depth, bound, ply);
+        }
+
         return bestScore;
     }
 
-    bool searchRoot(Board* b, std::vector<Move>& rootMoves,
+    bool searchRoot(Board* b, std::vector<Move>& moves,
                     int depth, int alpha, int beta,
                     int& outScore, Move& outMove) {
         if (!visit())
             return false;
 
         uint64_t repKey = positionKey(b);
-        uint64_t key = ttKey(b, repKey);
+        uint64_t key = tableKey(b, repKey);
 
         path[0] = repKey;
         pathHalfmove[0] = b->halfmoveClock;
         evalStack[0] = evaluate_position(b);
+        previousMove[0] = 0;
 
         Move ttMove = 0;
-        if (TTEntry* entry = probe(key))
-            ttMove = entry->move;
 
-        orderRoot(b, rootMoves, ttMove);
+        if (TTEntry* e = probe(key))
+            ttMove = e->move;
+
+        orderRoot(b, moves, ttMove);
 
         int originalAlpha = alpha;
         int bestScore = -INF;
-        Move bestMove = rootMoves.front();
+        Move bestMove = moves.front();
         int searched = 0;
+        uint64_t repBefore = repetitionHits;
 
-        for (Move move : rootMoves) {
+        for (Move move : moves) {
+            previousMove[1] = move;
+
             Undo undo{};
             board_make_move(b, move, &undo);
 
@@ -977,10 +930,12 @@ struct SearchContext {
                 break;
         }
 
-        Bound bound = bestScore <= originalAlpha ? BOUND_UPPER :
-                      bestScore >= beta ? BOUND_LOWER : BOUND_EXACT;
+        if (repetitionHits == repBefore) {
+            Bound bound = bestScore <= originalAlpha ? BOUND_UPPER :
+                          bestScore >= beta ? BOUND_LOWER : BOUND_EXACT;
 
-        store(key, bestMove, bestScore, depth, bound, 0);
+            store(key, bestMove, bestScore, depth, bound, 0);
+        }
 
         outScore = bestScore;
         outMove = bestMove;
@@ -999,16 +954,17 @@ SearchResult search_best_move(
     SearchControl* control) {
 
     SearchResult result;
-
     if (!board)
         return result;
 
     SearchContext ctx(control, nodeLimit);
+    ctx.start = Clock::now();
+
     maxDepth = std::clamp(maxDepth, 1, MAX_PLY - 2);
 
-    Move legalMoves[MAX_MOVES];
+    Move legal[MAX_MOVES];
     int legalCount = 0;
-    generate_legal_moves_fast(board, legalMoves, &legalCount);
+    generate_legal_moves_fast(board, legal, &legalCount);
 
     if (legalCount == 0) {
         result.score = is_in_check(board, board->sideToMove) ? -MATE : 0;
@@ -1020,32 +976,33 @@ SearchResult search_best_move(
 
     if (searchMoves.empty()) {
         for (int i = 0; i < legalCount; ++i)
-            roots.push_back(legalMoves[i]);
+            roots.push_back(legal[i]);
     } else {
         for (int i = 0; i < legalCount; ++i) {
-            std::string uci = move_to_uci(legalMoves[i]);
+            std::string uci = move_to_uci(legal[i]);
 
             if (std::find(searchMoves.begin(), searchMoves.end(), uci)
-                != searchMoves.end()) {
-                roots.push_back(legalMoves[i]);
-            }
+                != searchMoves.end())
+                roots.push_back(legal[i]);
         }
     }
 
     if (roots.empty())
         return result;
 
-    // Always have a legal fallback if the search is stopped mid-iteration.
     result.bestMove = move_to_uci(roots.front());
     result.score = evaluate_position(board);
-    result.depth = 0;
 
     int previousScore = result.score;
 
     for (int depth = 1; depth <= maxDepth && !ctx.stopped; ++depth) {
         int window = depth >= 4 ? 40 : INF;
-        int alpha = std::max(-INF, previousScore - window);
-        int beta = std::min(INF, previousScore + window);
+
+        int alpha = window == INF ? -INF :
+                    std::max(-INF, previousScore - window);
+
+        int beta = window == INF ? INF :
+                   std::min(INF, previousScore + window);
 
         int score = previousScore;
         Move bestMove = roots.front();
@@ -1056,11 +1013,29 @@ SearchResult search_best_move(
                                 score, bestMove))
                 break;
 
-            // Re-search with wider aspiration windows on failure.
-            if (window < INF && (score <= alpha || score >= beta)) {
+            if (score <= alpha && alpha > -INF) {
                 window = std::min(INF, window * 2);
-                alpha = std::max(-INF, score - window);
-                beta = std::min(INF, score + window);
+
+                if (window == INF) {
+                    alpha = -INF;
+                    beta = INF;
+                } else {
+                    alpha = std::max(-INF, score - window);
+                }
+
+                continue;
+            }
+
+            if (score >= beta && beta < INF) {
+                window = std::min(INF, window * 2);
+
+                if (window == INF) {
+                    alpha = -INF;
+                    beta = INF;
+                } else {
+                    beta = std::min(INF, score + window);
+                }
+
                 continue;
             }
 
