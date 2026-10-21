@@ -1,0 +1,34 @@
+# CMake build output
+/build/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Compiled binaries and object files
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Match runner inputs and generated results
+/engines/
+/results/
+/requirements.txt
+/match_runner.py
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
